@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "math.h"
+#include "NRF24L01P.h"
+#include "DHT11.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,8 +45,12 @@
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+SPI_HandleTypeDef hspi2;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim4;
 
 /* USER CODE BEGIN PV */
 int16_t ax = 0, ay = 0 , az = 0, gx = 0 ,gy = 0 , gz = 0;
@@ -58,17 +64,33 @@ float Ki = 2000;          // (I)ntegral Tuning Parameter
 float Kd =5;          // (D)erivative Tuning Parameter
 -----------------------
 */
-//--------4x18650 & buck 12v-------------
-float Kp = 330;          // (P)roportional Tuning Parameter
-float Ki = 6000;          // (I)ntegral Tuning Parameter        
-float Kd =4;          // (D)erivative Tuning Parameter  
+
+float Kp_a =300;          // (P)roportional Tuning Parameter
+float Ki_a = 0;          // (I)ntegral Tuning Parameter        
+float Kd_a = 0.4;          // (D)erivative Tuning Parameter  
+
+float Kp_p =0.04;//0.05;          // (P)roportional Tuning Parameter
+float Ki_p = 0;          // (I)ntegral Tuning Parameter        
+float Kd_p = 0.0001;//0.001;          // (D)erivative Tuning Parameter
+float iTerm_p = 0;       // Used to accumulate error (integral)
+float lastTime_p = 0;    // Records the time the function was last called
+float maxPID_p = 30;    // The maximum value that can be output
+float oldValue_p = 0;    // The last sensor value
+float targetValue_p = 0;
+float pwmDead_p = 0;
 //---------------------------------------
-float iTerm = 0;       // Used to accumulate error (integral)
-float lastTime = 0;    // Records the time the function was last called
-float maxPID = 999;    // The maximum value that can be output
-float oldValue = 0;    // The last sensor value
-float targetValue = 0;
-float pwmDead = 0;
+float iTerm_a = 0;       // Used to accumulate error (integral)
+float lastTime_a = 0;    // Records the time the function was last called
+float maxPID_a = 999;    // The maximum value that can be output
+float oldValue_a = 0;    // The last sensor value
+float targetValue_a = 0;
+float pwmDead_a = 0;
+
+short encoder = 0;
+
+int count_dht = 0;
+int count_dht_current = 0;
+int count_dht_last = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,6 +99,9 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_SPI2_Init(void);
+static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t MPU6050Init(void);
 void MPU6050ReadG(void);
@@ -126,91 +151,92 @@ void MPU6050ReadA(void){
 }
 void filter(float AX, float AY, float AZ, float GX, float GY, float GZ,uint16_t dt){
 	
-	float pitchG = pitch + GX*(dt/1000000.0f);
-	float rollG = roll + GY*(dt/1000000.0f);
+	float pitchG = pitch + GX*(dt/64000.0f);
+	float rollG = roll + GY*(dt/64000.0f);
 	
 	float pitchA = atan2(AY, sqrt(AX*AX + AZ * AZ))*RTD;
 	float rollA = atan2(AX, sqrt(AY*AY + AZ*AZ))*RTD;
 	
-	pitch = 0.98*pitchG + 0.02*pitchA;
-	roll = 0.98*rollG + 0.02*rollA;
+	pitch = 0.99*pitchG + 0.01*pitchA;
+	roll = 0.99*rollG + 0.01*rollA;
 
 }
 /*
-ENA: PA1
-ENB: PA0
-IN1: PA5
-IN2: PA4
-IN3: PA3
-IN4: PA2
+IN1: PA0
+IN2: PA1
+IN3: PA2
+IN4: PA3
 roll < 0 -> Up
 roll > 0 -> Down
 */
 void PWM_Start(void){
 	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-}
-void Right_Up(void){
-	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_5,1);
-	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,0);
-}
-void Left_Up(void){
-	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_3,0);
-	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_2,1);
-}
-void Right_Down(void){
-	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_5,0);
-	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,1);
-}
-void Left_Down(void){
-	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_3,1);
-	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_2,0);
+	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
 }
 void Update_PWM(int16_t pwm){
 	if(pwm > 0){
-		Right_Up();
-		Left_Up();
 		htim2.Instance->CCR1 = pwm;
-		htim2.Instance->CCR2 = pwm;
+		htim2.Instance->CCR2 = 0;
+		htim2.Instance->CCR3 = pwm;
+		htim2.Instance->CCR4 = 0;
 		return;
 	}
-	Right_Down();
-	Left_Down();
-	htim2.Instance->CCR1 = -pwm;
+	htim2.Instance->CCR1 = 0;
 	htim2.Instance->CCR2 = -pwm;
+	htim2.Instance->CCR3 = 0;
+	htim2.Instance->CCR4 = -pwm;
 }
-void delayus(uint16_t time){
-	htim1.Instance->CNT = 0;
-	while(htim1.Instance->CNT < time);
-}
-void delayms(uint16_t time){
-	for(uint16_t i = 0; i<time; i++){
-		delayus(1000);
-	}
-}
-int16_t pid(float target, float current,uint16_t dt) {
+int16_t pid_angle(float target, float current,int64_t dt) {
 	// Calculate the time since function was last called
-	float dT = (float)dt/1000000.0f;
+	float dT = (float)dt/64000.0f;
 
 	// Calculate error between target and current values
 	float error = target - current;
 
 	// Calculate the integral term
-	iTerm += error * dT; 
+	iTerm_a += error * dT;
+	if(iTerm_a > 0.7) iTerm_a = 0.7;
+	if(iTerm_a < -0.7) iTerm_a = -0.7;
 	// Calculate the derivative term (using the simplification)
-	float dTerm = (oldValue - current) / dT;
+	float dTerm = (oldValue_a - current) / dT;
 
 	// Set old variable to equal new ones
-	oldValue = current;
+	oldValue_a = current;
 
 	// Multiply each term by its constant, and add it all up
-	float result = (error * Kp) + (iTerm * Ki) + (dTerm * Kd);
+	float result = (error * Kp_a) + (iTerm_a * Ki_a) + (dTerm * Kd_a);
 
 	// Limit PID value to maximum values
-	if (result > maxPID) result = maxPID;
-	else if (result < -maxPID) result = -maxPID;
-    if (result > 0 && result < pwmDead) result = pwmDead;
-    if (result < 0 && result > -pwmDead) result = -pwmDead;
+	if (result > maxPID_a) result = maxPID_a;
+	else if (result < -maxPID_a) result = -maxPID_a;
+
+	return (int16_t)result;
+}
+int16_t pid_position(float target, float current,int64_t dt) {
+	// Calculate the time since function was last called
+	float dT = (float)dt/64000.0f;
+
+	// Calculate error between target and current values
+	float error = target - current;
+
+	// Calculate the integral term
+	iTerm_p += error * dT;
+	if(iTerm_p > 1) iTerm_p = 1;
+	if(iTerm_p < -1) iTerm_p = -1;
+	// Calculate the derivative term (using the simplification)
+	float dTerm = (oldValue_p - current) / dT;
+
+	// Set old variable to equal new ones
+	oldValue_p = current;
+
+	// Multiply each term by its constant, and add it all up
+	float result = -((error * Kp_p) + (iTerm_p * Ki_p) + (dTerm * Kd_p));
+
+	// Limit PID value to maximum values
+	if (result > maxPID_p) result = maxPID_p;
+	else if (result < -maxPID_p) result = -maxPID_p;
 
 	return (int16_t)result;
 }
@@ -248,36 +274,60 @@ int main(void)
   MX_I2C1_Init();
   MX_TIM2_Init();
   MX_TIM1_Init();
+  MX_TIM3_Init();
+  MX_SPI2_Init();
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
 	MPU6050Init();
 	PWM_Start();
 	HAL_TIM_Base_Start(&htim1);
+	HAL_TIM_Base_Start(&htim4);
+	HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_1 | TIM_CHANNEL_2);
 	HAL_GPIO_WritePin(GPIOB,GPIO_PIN_2,1);
-	delayms(500);
+	HAL_Delay(500);
+	DHT11_Read();
 	HAL_GPIO_WritePin(GPIOB,GPIO_PIN_2,0);
 	uint16_t x = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-		x=htim1.Instance->CNT;
-		htim1.Instance->CNT=0;
-		MPU6050ReadG();
-		MPU6050ReadA();
-		filter(AX, AY, AZ, GX, GY, GZ,x);
-		int16_t pwmvalue = pid(targetValue, pitch,x);
-		Update_PWM(pwmvalue);
-		if(pitch > 70 || pitch < -70){
-			HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
-			HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
-			while(1);
-		}
-    /* USER CODE END WHILE */
+uint32_t lastLoop = 0;
+const uint32_t loopInterval = 10;
 
-    /* USER CODE BEGIN 3 */
-  }
+uint32_t lastDHT = 0;
+const uint32_t DHTInterval = 4000; 
+	while (1){
+		uint32_t now = HAL_GetTick();
+		if (now - lastLoop >= loopInterval){
+			lastLoop = now;
+
+			encoder = __HAL_TIM_GET_COUNTER(&htim3);
+			x = htim1.Instance->CNT;
+			htim1.Instance->CNT = 0;
+
+			MPU6050ReadG();
+			MPU6050ReadA();
+			filter(AX, AY, AZ, GX, GY, GZ, x);
+
+			targetValue_a = pid_position(targetValue_p, encoder, x) + 4.4;
+			int16_t pwmvalue = pid_angle(targetValue_a, pitch, x);
+			Update_PWM(pwmvalue);
+
+			if (pitch > 60 || pitch < -60){
+				HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+				HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+				HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_3);
+				HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_4);
+				while (1);
+			}
+		}
+		if (now - lastDHT >= DHTInterval){
+			lastDHT = now;
+			DHT11_Read();
+		}		
+	}
+
   /* USER CODE END 3 */
 }
 
@@ -336,7 +386,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -351,6 +401,44 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
 
 }
 
@@ -373,7 +461,7 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 71;
+  htim1.Init.Prescaler = 1124;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim1.Init.Period = 65535;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -456,10 +544,112 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM2_Init 2 */
 
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 35;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 65535;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
 
 }
 
@@ -480,24 +670,24 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_12, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PA2 PA3 PA4 PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PB2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  /*Configure GPIO pins : PB1 PB2 PB12 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_12;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
